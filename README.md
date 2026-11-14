@@ -1,7 +1,7 @@
 # aid-zuul-config
 
-Zuul's trusted config project for AIDepartment (AIDepartment#1341, #1344, #1346): the pipelines, the base job and,
-with AIDepartment#1351, the secrets' definitions. AIDepartment's own jobs are not here: they are in AIDepartment's
+Zuul's trusted config project for AIDepartment (AIDepartment#1341, #1344, #1346): the pipelines, the base job, and
+the jobs with secrets and their secrets (AIDepartment#1351). AIDepartment's own jobs are not here: they are in AIDepartment's
 `ci/zuul/`, which says how the two fit together (its `ci/zuul/README.md`).
 
 | Path | What |
@@ -10,6 +10,10 @@ with AIDepartment#1351, the secrets' definitions. AIDepartment's own jobs are no
 | [`zuul.d/jobs.yaml`](zuul.d/jobs.yaml) | `base`, every job's parent: one build node, a 2-hour timeout, and the checkout |
 | [`playbooks/base/`](playbooks/base) | the base job's playbooks |
 | [`zuul.d/project.yaml`](zuul.d/project.yaml) | this repository's own `check`, which validates a pull request here and runs nothing |
+| [`zuul.d/release.yaml`](zuul.d/release.yaml) | `aid-release-credentials`, the release's credential check, and where it runs: `post` for AIDepartment |
+| `zuul.d/secrets.yaml` | the secrets, each encrypted for this project's key by AIDepartment's `deploy/zuul/encrypt-secret.sh` |
+| [`playbooks/secrets/guard.yaml`](playbooks/secrets/guard.yaml) | the pre-run of every job with a secret |
+| [`playbooks/release/`](playbooks/release) | the release's credential check: a token of the App `aid-release`, made, checked and revoked |
 
 ## Trusted
 
@@ -53,3 +57,19 @@ fake readable farm token and proves that all four malicious hooks run in `check`
 The node's SSH host key is pinned in the provider. On rotation, generate the new SSH Secrets in AIDepartment, update
 `host-key` here in the same rollout, and restart the pod and executor. Only the public key belongs here. The private
 keys stay in AID's keychain and Kubernetes Secrets.
+
+## Jobs with secrets
+
+AIDepartment's `deploy/zuul/job-secrets.md` has the model: each secret's plaintext is in AID's keychain, and jobs get
+it only as a secret here, encrypted for this project's key. A secret is defined only here, never in AIDepartment, and a
+job that names one:
+
+- is defined here, in a file of `zuul.d/` with only such jobs and where they run (the test bed leaves those files out);
+- is `final: true` and `post-review: true`, with `allowed-projects`;
+- runs with `nodeset: {nodes: []}`, or on a node of its own, never `aid-node`;
+- starts with `pre-run: playbooks/secrets/guard.yaml`, and sets `secret_pipelines` and `secret_projects` in its `vars`.
+
+To add or rotate a secret, encrypt it from the keychain with `deploy/zuul/encrypt-secret.sh --expect-key <the key in
+job-secrets.md>`, and replace its stanza in `zuul.d/secrets.yaml` by a pull request. Zuul's `check` here decrypts it
+as it loads the proposed configuration, so a stanza for another key is reported there. After the merge, the job's next
+run uses it.
