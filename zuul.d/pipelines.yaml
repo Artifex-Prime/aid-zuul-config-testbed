@@ -4,8 +4,8 @@
 # Shaped as in the trial (AIDepartment#1342), which saw them work on GitHub, with AIDepartment#1344's trust model
 # (its deploy/zuul/github.md): check only for accounts with write access, check-external for anyone's pull request on
 # a maintainer's comment, and every report a check run of the GitHub App aid-zuul (aid/check, aid/check-external,
-# aid/gate). gate and hold do what Mergify does for AIDepartment today (AIDepartment#1347): its ci/zuul/gate.md maps
-# each of Mergify's rules onto them.
+# aid/gate). AIDepartment#1347 maps Mergify's rules onto gate (what enters it, the hold label, the window, the merge
+# mode).
 
 - pipeline:
     name: check
@@ -68,54 +68,26 @@
 - pipeline:
     name: gate
     description: |
-      A pull request that is ready for review, has passed check on its head and has no "hold" label: tested in order,
-      each on top of those ahead of it, and merged if it passes.
+      Pull requests labelled "gate" are tested in order, each on top of those ahead of it, and merged if they pass.
     manager: dependent
     precedence: high
     supercedes: check
-    # What may enter, as Mergify's queue conditions today (AIDepartment's ci/zuul/gate.md): ready (no draft), check
-    # passed on the pull request's head (Mergify's "Cheap checks passed"), and no hold label. check runs only on a head
-    # an account with write access pushed (deploy/zuul/github.md), so a stranger's pull request enters only once
-    # someone with write vouches for its head by pushing to it.
     require:
       github:
+        label: gate
         open: true
         current-patchset: true
-        draft: false
-        status: 'github-actions(\[bot\])?:aid/check:success'
     reject:
       github:
         label: hold
-    # The events after which those may have become true. Each enqueues only if the requirements hold; the requirements
-    # are read again from GitHub then, so no event lets in what they would not.
     trigger:
       github:
-        # Marked ready: "ready means queued".
         - event: pull_request
-          action: ready_for_review
-        # check passed on the head, after the pull request was ready: a new push to a ready pull request comes back by
-        # itself once check passes on it. GitHub sends a check run's completion to the App that made it.
-        - event: pull_request
-          action: status
-          status: 'github-actions(\[bot\])?:aid/check:success'
+          action: labeled
+          label: [gate]
         - event: pull_request
           action: unlabeled
-          label: hold
-        # Mergify's requeue: after a failure, once someone has looked.
-        - event: pull_request
-          action: comment
-          comment: (?i)^\s*regate\s*$
-    # The speculative window: how many pull requests at the queue's head are tested at once, each on top of those ahead
-    # of it. Two, as a Mergify batch is two today; a failure halves it (down to one, the floor), each pull request
-    # that merges adds one again (up to two, the ceiling). Build nodes bound it too: the jobs of a pull request in the
-    # window wait for nodes (AIDepartment#1345). AIDepartment's ci/zuul/gate.md, "Speculative depth", says why two.
-    window: 2
-    window-floor: 1
-    window-ceiling: 2
-    window-increase-type: linear
-    window-increase-factor: 1
-    window-decrease-type: exponential
-    window-decrease-factor: 2
+          label: [hold]
     enqueue:
       github:
         status: pending
@@ -133,25 +105,23 @@
       github:
         status: failure
         comment: true
+        unlabel: gate
     dequeue:
       github:
         comment: false
 
 - pipeline:
-    name: hold
+    name: post
     description: |
-      Takes a pull request out of gate when it is labelled "hold" or turned back into a draft, as Mergify dequeues one
-      today. It runs nothing (noop) and reports nothing.
-    manager: independent
-    # A pull request enqueued here is dequeued from gate, which cancels its jobs there and starts again those of the
-    # pull requests behind it, without it. gate's requirements keep it out until hold is removed (or it is ready
-    # again), and gate's triggers bring it back.
-    supercedes: gate
-    # Taking a pull request out never lets anything in, so anyone who may label it or make it a draft may.
+      After a merge: a push to main of a project, run on what was merged. Post-review, so it is where a job that has a
+      secret may run (AIDepartment's deploy/zuul/job-secrets.md); AIDepartment#1350 gives it the jobs that publish.
+    # Each project's newest push supersedes one still waiting: what runs is main as it is.
+    manager: supercedent
+    post-review: true
+    precedence: low
     trigger:
       github:
-        - event: pull_request
-          action: labeled
-          label: hold
-        - event: pull_request
-          action: converted_to_draft
+        - event: push
+          ref: ^refs/heads/main$
+    # No reporter: a push has no pull request to report on. Each build is in Zuul's database and its API
+    # (/api/tenant/aid/builds?pipeline=post); AIDepartment#1349 sends AID the results.
