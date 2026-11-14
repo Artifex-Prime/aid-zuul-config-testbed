@@ -41,7 +41,8 @@
     name: check-external
     description: |
       Any pull request, a stranger's among them, when an account with write access comments "check-external". No
-      secret, and no farm: the base job gives the farm's credential only in the pipelines that may have it.
+      secret, and no farm: the trusted base rejects jobs before untrusted playbooks until a credential-free
+      execution boundary exists (AIDepartment#1345).
     manager: independent
     trigger:
       github:
