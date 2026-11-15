@@ -175,7 +175,7 @@
     name: post
     description: |
       After a merge: a push to main of a project, run on what was merged. Post-review, so it is where a job that has a
-      secret may run (AIDepartment's deploy/zuul/job-secrets.md); AIDepartment#1350 gives it the jobs that publish.
+      secret may run (AIDepartment's deploy/zuul/job-secrets.md): the jobs that publish (zuul.d/publish.yaml).
     # Each project's newest push supersedes one still waiting: what runs is main as it is.
     manager: supercedent
     post-review: true
@@ -184,6 +184,24 @@
       github:
         - event: push
           ref: ^refs/heads/main$
-    # No reporter yet. A push has no pull request for GitHub's reporter; how post's results reach AID comes with the
-    # jobs that publish (AIDepartment#1350) and AID's events from Zuul (AIDepartment#1526). Until then each build is in
-    # Zuul's database and its API (/api/tenant/aid/builds?pipeline=post).
+    # No reporter: a push has no pull request for GitHub's reporter. A failed release opens its issue (aid-release's
+    # post-run, AIDepartment#1350); AID's events from Zuul are AIDepartment#1526. Each build is in Zuul's database and
+    # its API (/api/tenant/aid/builds?pipeline=post).
+
+- pipeline:
+    name: periodic
+    description: |
+      AIDepartment's nightly on main (AIDepartment#1350): at 02:00 and 03:00 UTC, of which its jobs let through only the
+      one that is 04:00 in Madrid, as nightly.yml's clock does on GitHub Actions (AIDepartment's ci/nightly.mjs).
+      Post-review, as post: what runs is main, merged and reviewed, and its report job has a secret.
+    # Zuul's timer has no time zone: it fires in the scheduler's, UTC. 04:00 in Madrid is 02:00 UTC in summer (CEST)
+    # and 03:00 in winter (CET).
+    manager: independent
+    post-review: true
+    precedence: low
+    trigger:
+      timer:
+        - time: '0 2 * * *'
+        - time: '0 3 * * *'
+    # No reporter: a timer's item has no pull request. aid-nightly-report writes the result to AIDepartment's
+    # ci-nightly issue, and each build is in Zuul's API (/api/tenant/aid/builds?pipeline=periodic).

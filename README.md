@@ -6,7 +6,7 @@ the jobs with secrets and their secrets (AIDepartment#1351). AIDepartment's own 
 
 | Path | What |
 | --- | --- |
-| [`zuul.d/pipelines.yaml`](zuul.d/pipelines.yaml) | `check`, `check-external` and `gate`, reported as check runs of the App `aid-zuul`, and `hold`, which takes a pull request out of `gate` and reports nothing. AIDepartment's `ci/zuul/gate.md` says how `gate` and `hold` do what Mergify does |
+| [`zuul.d/pipelines.yaml`](zuul.d/pipelines.yaml) | `check`, `check-external` and `gate`, reported as check runs of the App `aid-zuul`, and `hold`, which takes a pull request out of `gate` and reports nothing. AIDepartment's `ci/zuul/gate.md` says how `gate` and `hold` do what Mergify does. `post` after a merge and `periodic` at 02:00 and 03:00 UTC, both post-review (AIDepartment's `ci/zuul/publish.md`) |
 | [`zuul.d/jobs.yaml`](zuul.d/jobs.yaml) | `base`, every job's parent: one build node, a 2-hour timeout, the checkout, and the build's logs kept (AIDepartment deploy/zuul/web.md) |
 | [`playbooks/base/`](playbooks/base) | the base job's playbooks |
 | [`zuul.d/project.yaml`](zuul.d/project.yaml) | this repository's own `check`, which validates a pull request here and runs nothing |
@@ -14,6 +14,9 @@ the jobs with secrets and their secrets (AIDepartment#1351). AIDepartment's own 
 | `zuul.d/secrets.yaml` | the secrets, each encrypted for this project's key by AIDepartment's `deploy/zuul/encrypt-secret.sh` |
 | [`playbooks/secrets/guard.yaml`](playbooks/secrets/guard.yaml) | the pre-run of every job with a secret |
 | [`playbooks/release/`](playbooks/release) | the release's credential check: a token of the App `aid-release`, made, checked and revoked |
+| [`zuul.d/publish.yaml`](zuul.d/publish.yaml) | what publishes from AIDepartment's `main` (AIDepartment#1350): `aid-publish-apps` and `aid-release` in `post`, on the post node, and `aid-nightly-report` in `periodic`. AIDepartment's `ci/zuul/publish.md` says what each does |
+| [`playbooks/publish/`](playbooks/publish) | their stages: AIDepartment's script for the job, one stage per playbook, each with only the credentials it uses (`stage.yaml`) |
+| [`playbooks/nightly/`](playbooks/nightly) | the nightly's result, to AIDepartment's `ci-nightly` issue |
 | [`tests/`](tests) | the tests of the release's credential check and of the guard ([Tests](#tests)) |
 
 ## Trusted
@@ -69,7 +72,8 @@ job that names one:
 
 - is defined here, in a file of `zuul.d/` with only such jobs and where they run (the test bed leaves those files out);
 - is `final: true` and `post-review: true`, with `allowed-projects`;
-- runs with `nodeset: {nodes: []}`, or on a node of its own, never `aid-node`;
+- runs with `nodeset: {nodes: []}`, or on a node of its own, never `aid-node`: the publishing jobs run on `aid-post-node`
+  (AIDepartment's `deploy/zuul/post-node/`), which only they name;
 - starts with `pre-run: playbooks/secrets/guard.yaml`, and sets `secret_pipelines` and `secret_projects` in its `vars`.
 
 To add or rotate a secret, encrypt it from the keychain with `deploy/zuul/encrypt-secret.sh --expect-key <the key in
@@ -104,6 +108,15 @@ is why the tests run Zuul's plugins.
   passes, and a change, another pipeline or another project fails without a retry. And it checks that its Ansible is
   Zuul's: a `no_log` command task registers no output. `zuul_return` is a stand-in (`tests/plugins/action/`) that
   records what a playbook returns.
+
+- `test_publish.py` runs each stage of `playbooks/publish/` the same way, with a stand-in for AIDepartment's stage
+  script that records what reached it: each stage's App token with only its permissions, or none; Zuul's pusher token
+  in `push` alone; both `0600` on the node, and gone, the App's revoked, when the stage ends, after a failure too; a
+  `publish_endpoints` without a value failing before anything; and `report` only after a failure. It runs
+  `playbooks/nightly/report.py` against stand-ins for Zuul's builds API and GitHub's issues: only the timer that is
+  04:00 in Madrid, across both changes of the clock, and only while AIDepartment's `ci/publisher` names Zuul; a pass
+  closes the open `ci-nightly` issue, a failure or no result opens it or comments on it. `playbooks/nightly/report.yaml`
+  itself is checked on ThunderBox, at its first night.
 
 ansible-core 2.18 runs on Python 3.11 to 3.13:
 
