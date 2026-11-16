@@ -33,9 +33,7 @@ define no pipeline and no base job, and Zuul refuses either with a configuration
 ## Changing it
 
 - **Never merge here yourself, and never push to `main`.** `main` is protected: a change is a pull request, reviewed
-  by the other bot, and merged by the orchestrator. Nothing merges into it automatically, Zuul included: an approved
-  pull request here enters `gate`, which has no jobs for it, so `aid/gate` goes from queued to skipped and nothing
-  merges (AIDepartment#1660).
+  by the other bot, and merged by the orchestrator. Nothing merges into it automatically, Zuul included.
 - **Test it first on AIDepartment's test bed** (its `ci/zuul/README.md`, "The test bed"): it runs Zuul with a copy of
   this repository's branch as the config project and AIDepartment's jobs as the untrusted project, and checks that the
   layout loads and that AIDepartment's pull requests still run speculatively. Link the run in the pull request.
