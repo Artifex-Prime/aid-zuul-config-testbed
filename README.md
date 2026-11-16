@@ -33,7 +33,9 @@ define no pipeline and no base job, and Zuul refuses either with a configuration
 ## Changing it
 
 - **Never merge here yourself, and never push to `main`.** `main` is protected: a change is a pull request, reviewed
-  by the other bot, and merged by the orchestrator. Nothing merges into it automatically, Zuul included.
+  by the other bot, and merged by the orchestrator. Nothing merges into it automatically, Zuul included: an approved
+  pull request here enters `gate`, which has no jobs for it, so `aid/gate` goes from queued to skipped and nothing
+  merges (AIDepartment#1660).
 - **Test it first on AIDepartment's test bed** (its `ci/zuul/README.md`, "The test bed"): it runs Zuul with a copy of
   this repository's branch as the config project and AIDepartment's jobs as the untrusted project, and checks that the
   layout loads and that AIDepartment's pull requests still run speculatively. Link the run in the pull request.
@@ -44,7 +46,7 @@ define no pipeline and no base job, and Zuul refuses either with a configuration
 
 ## The build node
 
-`zuul.d/providers.yaml` registers one PR-only k3s pod as `aid-node` (AIDepartment#1345). A second provider, `aid-k3s-post`, registers the post node as `aid-post-node` (AIDepartment#1350): only `zuul.d/publish.yaml`'s jobs name it. Its deployment, checked image,
+`zuul.d/providers.yaml` registers one PR-only k3s pod as `aid-node` (AIDepartment#1345). A second provider, `aid-k3s-post`, registers the post node as `aid-post-node` (AIDepartment#1350): only `zuul.d/publish.yaml`'s jobs name it. The labels `aid-gate-node` and `aid-staging-node` are the gate's image and staging nodes' (AIDepartment#1521), named by AIDepartment's own nodesets. A third provider, `aid-k3s-gate`, registers the gate's image node as `aid-gate-node`; the staging node has no provider until it exists. Its deployment, checked image,
 network policies and quota are AIDepartment's `deploy/zuul/node/`. Zuul's static provider assigns one job at a time;
 `base` bounds a job at 7200 seconds. The shared connection `aid-nodes` is `driver=static` in the deployed `zuul.conf`.
 
