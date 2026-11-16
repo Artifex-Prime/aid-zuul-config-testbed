@@ -6,7 +6,7 @@ the jobs with secrets and their secrets (AIDepartment#1351). AIDepartment's own 
 
 | Path | What |
 | --- | --- |
-| [`zuul.d/pipelines.yaml`](zuul.d/pipelines.yaml) | `check`, `check-external` and `gate`, reported as check runs of the App `aid-zuul`, and `hold`, which takes a pull request out of `gate` and reports nothing. AIDepartment's `ci/zuul/gate.md` says how `gate` and `hold` do what Mergify does. `post` after a merge and `periodic` at 02:00 and 03:00 UTC, both post-review (AIDepartment's `ci/zuul/publish.md`) |
+| [`zuul.d/pipelines.yaml`](zuul.d/pipelines.yaml) | `check`, `check-external` and `gate`, reported as check runs of the App `aid-zuul`, and `hold`, which takes a pull request out of `gate` and reports nothing. AIDepartment's `ci/zuul/gate.md` says how `gate` and `hold` do what Mergify does. `post` after a merge, and `periodic-0200` and `periodic-0300` at 02:00 and 03:00 UTC, all post-review (AIDepartment's `ci/zuul/publish.md`) |
 | [`zuul.d/jobs.yaml`](zuul.d/jobs.yaml) | `base`, every job's parent: one build node, a 2-hour timeout, the checkout, and the build's logs kept (AIDepartment deploy/zuul/web.md) |
 | [`playbooks/base/`](playbooks/base) | the base job's playbooks |
 | [`zuul.d/project.yaml`](zuul.d/project.yaml) | this repository's own `check`, which validates a pull request here and runs nothing |
@@ -14,7 +14,7 @@ the jobs with secrets and their secrets (AIDepartment#1351). AIDepartment's own 
 | `zuul.d/secrets.yaml` | the secrets, each encrypted for this project's key by AIDepartment's `deploy/zuul/encrypt-secret.sh` |
 | [`playbooks/secrets/guard.yaml`](playbooks/secrets/guard.yaml) | the pre-run of every job with a secret |
 | [`playbooks/release/`](playbooks/release) | the release's credential check: a token of the App `aid-release`, made, checked and revoked |
-| [`zuul.d/publish.yaml`](zuul.d/publish.yaml) | what publishes from AIDepartment's `main` (AIDepartment#1350): `aid-publish-apps` and `aid-release` in `post`, on the post node, and `aid-nightly-report` in `periodic`. AIDepartment's `ci/zuul/publish.md` says what each does |
+| [`zuul.d/publish.yaml`](zuul.d/publish.yaml) | what publishes from AIDepartment's `main` (AIDepartment#1350): `aid-publish-apps` and `aid-release` for `post`, on the post node, and `aid-nightly-report` for the periodic pipelines. They run for AIDepartment from step 4 of AIDepartment's `ci/zuul/publish.md`, "Turning it on", and publish nothing while its `ci/publisher` names Actions |
 | [`playbooks/publish/`](playbooks/publish) | their stages: AIDepartment's script for the job, one stage per playbook, each with only the credentials it uses (`stage.yaml`) |
 | [`playbooks/nightly/`](playbooks/nightly) | the nightly's result, to AIDepartment's `ci-nightly` issue |
 | [`tests/`](tests) | the tests of the release's credential check and of the guard ([Tests](#tests)) |
@@ -44,7 +44,7 @@ define no pipeline and no base job, and Zuul refuses either with a configuration
 
 ## The build node
 
-`zuul.d/providers.yaml` registers one PR-only k3s pod as `aid-node` (AIDepartment#1345). Its deployment, checked image,
+`zuul.d/providers.yaml` registers one PR-only k3s pod as `aid-node` (AIDepartment#1345). A second provider, `aid-k3s-post`, registers the post node as `aid-post-node` (AIDepartment#1350): only `zuul.d/publish.yaml`'s jobs name it. Its deployment, checked image,
 network policies and quota are AIDepartment's `deploy/zuul/node/`. Zuul's static provider assigns one job at a time;
 `base` bounds a job at 7200 seconds. The shared connection `aid-nodes` is `driver=static` in the deployed `zuul.conf`.
 
@@ -63,6 +63,20 @@ fake readable farm token and proves that all four malicious hooks run in `check`
 The node's SSH host key is pinned in the provider. On rotation, generate the new SSH Secrets in AIDepartment, update
 `host-key` here in the same rollout, and restart the pod and executor. Only the public key belongs here. The private
 keys stay in AID's keychain and Kubernetes Secrets.
+
+## AID events (#1349)
+
+`aid-events` is the native MQTT connection in AIDepartment’s common Zuul configuration. Each active pipeline reports
+enqueue, start, terminal and dequeue actions to `aid/zuul/reports` at QoS 1, alongside its existing forge reporters.
+It sends no returned job data. Provision the private broker, scheduler mTLS route and the AID subscriber first
+(AIDepartment’s `deploy/zuul/events/README.md`); then merge this configuration and full-reconfigure. There is no job
+secret involved. The adapter confirms a gate success with the finalized SQL record before announcing a merge: the
+MQTT success report alone precedes Zuul’s merge confirmation.
+
+AIDepartment#1526: the first merge of these reporters (#8) preceded the connection, and the running scheduler
+unloaded `check`, `check-external` and `gate`. `aid/check` is the running scheduler's own load of a pull request's
+configuration, so it must pass on the pull request before it merges. AIDepartment's `deploy/zuul/protect-config.sh`
+makes `main` require it (pending: ThunderBox's step 11a).
 
 ## Jobs with secrets
 
@@ -113,10 +127,12 @@ is why the tests run Zuul's plugins.
   script that records what reached it: each stage's App token with only its permissions, or none; Zuul's pusher token
   in `push` alone; both `0600` on the node, and gone, the App's revoked, when the stage ends, after a failure too; a
   `publish_endpoints` without a value failing before anything; and `report` only after a failure. It runs
-  `playbooks/nightly/report.py` against stand-ins for Zuul's builds API and GitHub's issues: only the timer that is
-  04:00 in Madrid, across both changes of the clock, and only while AIDepartment's `ci/publisher` names Zuul; a pass
-  closes the open `ci-nightly` issue, a failure or no result opens it or comments on it. `playbooks/nightly/report.yaml`
-  itself is checked on ThunderBox, at its first night.
+  `playbooks/nightly/report.py`'s steps against stand-ins for Zuul's API and GitHub's issues: `decide` lets through
+  only the pipeline whose time is 04:00 in Madrid, across both changes of the clock and after a wait past the other
+  pipeline's time, and only while AIDepartment's `ci/publisher` names Zuul; `wait` reads Zuul's buildset API (the
+  stand-in refuses the builds API's filters, as Zuul 14.3.0 does), for over an hour and to its deadline, with no
+  credential; `report` closes the open `ci-nightly` issue on a pass, and opens it or comments on it otherwise. And
+  `playbooks/nightly/report.yaml` under Zuul's Ansible: its App token is made only after `wait`, and revoked.
 
 ansible-core 2.18 runs on Python 3.11 to 3.13:
 

@@ -5,6 +5,7 @@ playbooks/nightly/report.py against stand-ins for Zuul's builds API and GitHub's
 """
 
 import datetime
+import importlib.util
 import json
 import os
 import shutil
@@ -30,7 +31,7 @@ def token(name):
         return None
     return {"path": path, "value": open(path).read(), "mode": stat.S_IMODE(os.stat(path).st_mode)}
 seen = {"argv": sys.argv[1:], "cwd": os.getcwd(),
-        "env": {k: v for k, v in os.environ.items() if k.startswith(("ZUUL_", "BUILDKIT_", "CI_"))},
+        "env": {k: v for k, v in os.environ.items() if k.startswith(("ZUUL_", "BUILDKIT_", "CI_", "KUBERNETES_"))},
         "github": token("CI_GITHUB_TOKEN_FILE"), "pusher": token("CI_PUBLISH_TOKEN_FILE")}
 with open(os.path.join(os.environ["ZUUL_STATE"], "seen-" + sys.argv[1] + ".json"), "w") as handle:
     json.dump(seen, handle)
@@ -38,7 +39,8 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
 """
 ENDPOINTS = {"BUILDKIT_HOST": "tcp://buildkitd:1234", "CI_SCRATCH_REGISTRY": "scratch:5000",
              "CI_RUN_NAMESPACE": "imagecheck", "CI_PUBLISH_URL": "http://pusher/v1/publish",
-             "CI_PUBLISH_AUDIENCE": "thunderbox-registry", "CI_PUBLISH_TIMEOUT_SECONDS": "900"}
+             "CI_PUBLISH_AUDIENCE": "thunderbox-registry", "CI_PUBLISH_TIMEOUT_SECONDS": "900",
+             "KUBERNETES_SERVICE_HOST": "kubernetes.default.svc", "KUBERNETES_SERVICE_PORT": "443"}
 STAGES = {"build": {"permissions": ["contents=read"]}, "push": {"permissions": [], "pusher": True},
           "record": {"permissions": ["contents=write"]}, "report": {"permissions": ["issues=write"]}}
 
@@ -75,7 +77,10 @@ class StagePlaybookTest(unittest.TestCase):
             "zuul_success": success, "zuul_web_root": "https://zuul.example",
             "aid_release_github": {"app_id": stub_github.APP_ID, "private_key": PEM.decode()}, "aid_pusher": PUSHER,
             "publish_script": "ci/zuul/publish/apps.sh", "publish_stages": STAGES, "publish_endpoints": endpoints,
-            "publish_root": self.root, "publish_credentials": self.credentials}, self.work)
+            "publish_root": self.root, "publish_credentials": self.credentials}, self.work,
+            # The play's host is the node, and delegate_to: localhost reaches another host, as on Zuul's executor: a
+            # variable registered on the node is not localhost's (AIDepartment#1615).
+            inventory="node,")
 
     def seen(self, stage):
         with open(os.path.join(self.root, f"seen-{stage}.json")) as handle:
@@ -155,10 +160,13 @@ REPORT = os.path.join(ROOT, "playbooks", "nightly", "report.py")
 
 
 class Stand(ThreadingHTTPServer):
-    """Zuul's builds API and GitHub's issues, as far as report.py reads and writes them."""
+    """Zuul's buildset API and GitHub's issues, as far as report.py reads and writes them. Of Zuul's API it answers only
+    GET /api/tenant/aid/buildset/<uuid>, as Zuul 14.3.0 serves it (its builds have job_name and result): its builds
+    API has no buildset filter, and refuses one (AIDepartment#1550's review). `buildsets` are its answers in turn, the
+    last one again; None is a 404, a buildset Zuul has not stored yet."""
 
-    def __init__(self, builds, issues):
-        self.builds, self.issues, self.calls = builds, issues, []
+    def __init__(self, buildsets, issues):
+        self.buildsets, self.issues, self.calls = list(buildsets), issues, []
         stand = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -176,8 +184,11 @@ class Stand(ThreadingHTTPServer):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length)) if length else None
                 stand.calls.append((method, self.path, body, self.headers.get("Authorization")))
-                if self.path.startswith("/api/tenant/aid/builds?"):
-                    return self.answer(200, stand.builds.pop(0) if len(stand.builds) > 1 else stand.builds[0])
+                if self.path == f"/api/tenant/aid/buildset/{'s' * 32}":
+                    found = stand.buildsets.pop(0) if len(stand.buildsets) > 1 else stand.buildsets[0]
+                    return self.answer(404, {}) if found is None else self.answer(200, {"uuid": "s" * 32, "builds": found})
+                if self.path.startswith("/api/"):
+                    return self.answer(500, {"error": "unexpected keyword argument"})
                 if self.path.startswith("/repos/kristofk/AIDepartment/issues?"):
                     return self.answer(200, stand.issues)
                 if method == "POST" and self.path == "/repos/kristofk/AIDepartment/issues":
@@ -205,6 +216,17 @@ class Stand(ThreadingHTTPServer):
         self.server_close()
 
 
+def nightly(result, job="aid-nightly"):
+    return [{"job_name": "aid-nightly-report", "result": None}, {"job_name": job, "result": result}]
+
+
+def load_report():
+    spec = importlib.util.spec_from_file_location("report", REPORT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class NightlyReportTest(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.mkdtemp(prefix="nightly-")
@@ -219,60 +241,134 @@ class NightlyReportTest(unittest.TestCase):
         with open(path, "w") as handle:
             handle.write(text)
 
-    def report(self, stand, now, token=True):
-        args = [sys.executable, "-I", REPORT, "--publisher-file", self.publisher, "--zuul", stand.url, "--tenant", "aid",
-                "--buildset", "s" * 32, "--build-url", "https://zuul.example/t/aid/buildset/x", "--wait", "5",
-                "--now", now, "--api", stand.url] + (["--token-file", self.token] if token else [])
-        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    def step(self, *args):
+        result = subprocess.run([sys.executable, "-I", REPORT, *args], capture_output=True, text=True, timeout=60)
         return result.returncode, json.loads(result.stdout)
 
-    def test_only_the_timer_at_four_in_madrid_reports(self):
-        with Stand([[{"result": "SUCCESS"}]], []) as stand:
-            for now, report in [("2026-07-10T02:00:30+00:00", True), ("2026-07-10T03:00:30+00:00", False),
-                                ("2026-01-10T02:00:30+00:00", False), ("2026-01-10T03:00:30+00:00", True),
-                                # The changes of 2026: 29 March and 25 October, at 01:00 UTC.
-                                ("2026-03-29T02:01:00+00:00", True), ("2026-10-25T02:01:00+00:00", False),
-                                ("2026-10-25T03:01:00+00:00", True)]:
-                status, decided = self.report(stand, now, token=False)
-                self.assertEqual((status, decided["report"]), (0, report), (now, decided))
-            self.assertEqual(stand.calls, [], "deciding reads nothing")
+    def decide(self, pipeline, now):
+        return self.step("decide", "--pipeline", pipeline, "--publisher-file", self.publisher, "--now", now)
+
+    def report(self, stand, result):
+        return self.step("report", "--result", result, "--build-url", "https://zuul.example/t/aid/buildset/x",
+                         "--token-file", self.token, "--api", stand.url)
+
+    def test_only_the_pipeline_at_four_in_madrid_reports_also_after_waiting_past_the_other(self):
+        for pipeline, now, report in [
+                ("periodic-0200", "2026-07-10T02:00:30+00:00", True), ("periodic-0200", "2026-07-10T03:10:00+00:00", True),
+                ("periodic-0300", "2026-07-10T03:00:30+00:00", False), ("periodic-0200", "2026-01-10T02:00:30+00:00", False),
+                ("periodic-0300", "2026-01-10T03:00:30+00:00", True), ("periodic-0300", "2026-01-10T04:45:00+00:00", True),
+                # The changes of 2026: 29 March and 25 October, at 01:00 UTC.
+                ("periodic-0200", "2026-03-29T02:01:00+00:00", True), ("periodic-0200", "2026-10-25T02:01:00+00:00", False),
+                ("periodic-0300", "2026-10-25T03:01:00+00:00", True)]:
+            status, decided = self.decide(pipeline, now)
+            self.assertEqual((status, decided["report"]), (0, report), (pipeline, now, decided))
+        status, decided = self.decide("periodic", "2026-07-10T02:00:30+00:00")
+        self.assertEqual(status, 1)
+        self.assertIn("none of periodic-0200, periodic-0300", decided["error"])
 
     def test_only_while_ci_publisher_names_zuul(self):
         self.write(self.publisher, "actions\n")
-        with Stand([[{"result": "FAILURE"}]], []) as stand:
-            status, decided = self.report(stand, "2026-07-10T02:00:30+00:00")
+        status, decided = self.decide("periodic-0200", "2026-07-10T02:00:30+00:00")
         self.assertEqual((status, decided["report"]), (0, False))
         self.assertIn("names 'actions'", decided["why"])
-        self.assertEqual(stand.calls, [])
+
+    def test_wait_reads_this_buildset_from_zuuls_buildset_api(self):
+        with Stand([None, nightly(None), nightly("FAILURE")], []) as stand:
+            module = load_report()
+            result = module.nightly_result(stand.url, "aid", "s" * 32, deadline=10**10, sleep=lambda _: None)
+        self.assertEqual(result, "FAILURE")
+        self.assertEqual({path for _, path, _, _ in stand.calls}, {f"/api/tenant/aid/buildset/{'s' * 32}"})
+        # Its builds API, with a buildset filter, is what Zuul refuses.
+        with Stand([nightly("SUCCESS")], []) as stand:
+            with self.assertRaises(module.Failure):
+                module.call("GET", f"{stand.url}/api/tenant/aid/builds?buildset={'s' * 32}&job_name=aid-nightly")
+
+    def test_wait_past_an_hour_and_up_to_its_deadline_needs_no_credential(self):
+        module = load_report()
+        clock = {"now": 0.0}
+        def sleep(seconds):
+            clock["now"] += seconds
+        # The result after 70 minutes, then no result by the deadline: neither asks GitHub for anything.
+        with Stand([nightly(None)] * 70 + [nightly("SUCCESS")], []) as stand:
+            self.assertEqual(module.nightly_result(stand.url, "aid", "s" * 32, 6600, sleep=sleep, clock=lambda: clock["now"]), "SUCCESS")
+            self.assertEqual(clock["now"], 70 * 60)
+            self.assertFalse([call for call in stand.calls if call[3]], "a credential was sent while waiting")
+        clock["now"] = 0.0
+        with Stand([nightly(None)], []) as stand:
+            self.assertIsNone(module.nightly_result(stand.url, "aid", "s" * 32, 6600, sleep=sleep, clock=lambda: clock["now"]))
+            self.assertLessEqual(clock["now"], 6600)
 
     def test_a_pass_closes_the_open_issues(self):
-        with Stand([[], [{"result": None}], [{"result": "SUCCESS", "uuid": "u"}]], [{"number": 5}, {"number": 3, "pull_request": {}}]) as stand:
-            # Polled every minute in production; the stand-in answers at once, so the test waits on --wait only.
-            stand.builds = [[{"result": "SUCCESS", "uuid": "u"}]]
-            status, done = self.report(stand, "2026-07-10T02:00:30+00:00")
+        with Stand([None], [{"number": 5}, {"number": 3, "pull_request": {}}]) as stand:
+            status, done = self.report(stand, "SUCCESS")
         self.assertEqual((status, done["action"], done["issues"]), (0, "closed", [5]), done)
         writes = [(method, path, body) for method, path, body, _ in stand.calls if method != "GET"]
         self.assertEqual(writes, [("POST", "/repos/kristofk/AIDepartment/issues/5/comments", {"body": "Passed in https://zuul.example/t/aid/buildset/x"}),
                                   ("PATCH", "/repos/kristofk/AIDepartment/issues/5", {"state": "closed", "state_reason": "completed"})])
         self.assertTrue(all(auth == "Bearer ghs_nightly" for method, path, _, auth in stand.calls if path.startswith("/repos/")))
 
-    def test_a_failure_opens_the_issue_or_comments_on_it(self):
-        with Stand([[{"result": "FAILURE"}]], []) as stand:
-            status, done = self.report(stand, "2026-07-10T02:00:30+00:00")
+    def test_a_failure_or_no_result_opens_the_issue_or_comments_on_it(self):
+        with Stand([None], []) as stand:
+            status, done = self.report(stand, "FAILURE")
         self.assertEqual((status, done["action"], done["issues"]), (0, "created", [99]), done)
         created = [body for method, path, body, _ in stand.calls if method == "POST"][0]
         self.assertEqual((created["title"], created["labels"]), ("Nightly CI failed", ["ci-nightly"]))
         self.assertIn("ended with `FAILURE`", created["body"])
-        with Stand([[{"result": "TIMED_OUT"}]], [{"number": 7}, {"number": 9}]) as stand:
-            status, done = self.report(stand, "2026-07-10T02:00:30+00:00")
-        self.assertEqual((status, done["action"], done["issues"]), (0, "commented", [9]), done)
-
-    def test_no_result_in_time_is_a_failure(self):
-        with Stand([[{"result": None}]], []) as stand:
-            status, done = self.report(stand, "2026-07-10T02:00:30+00:00")
-        self.assertEqual((status, done["result"], done["action"]), (0, None, "created"), done)
+        with Stand([None], [{"number": 7}, {"number": 9}]) as stand:
+            status, done = self.report(stand, "")
+        self.assertEqual((status, done["result"], done["action"], done["issues"]), (0, None, "commented", [9]), done)
         body = [body for method, path, body, _ in stand.calls if method == "POST"][0]["body"]
         self.assertIn("has no result after the job allowed for it", body)
+
+
+class NightlyPlaybookTest(unittest.TestCase):
+    """playbooks/nightly/report.yaml under Zuul's Ansible: the App's token is made only once the result is known."""
+
+    def setUp(self):
+        self.work = tempfile.mkdtemp(prefix="nightly-playbook-")
+        self.addCleanup(shutil.rmtree, self.work)
+        shutil.copytree(os.path.join(ROOT, "playbooks", "nightly"), os.path.join(self.work, "playbooks", "nightly"))
+        os.makedirs(os.path.join(self.work, "playbooks", "release"))
+        self.src = os.path.join(self.work, "src")
+        os.makedirs(os.path.join(self.src, "ci"))
+        with open(os.path.join(self.src, "ci", "publisher"), "w") as handle:
+            handle.write("zuul\n")
+
+    def test_the_token_is_made_after_the_wait_and_revoked(self):
+        events = []
+        with stub_github.StubGitHub(KEY.public_key(), granted={"issues": "write"}) as stub, \
+                Stand([nightly("SUCCESS")], [{"number": 5}]) as stand:
+            # Shims of the two scripts' names: the real ones, pointed at the stand-ins, each step written down.
+            log = os.path.join(self.work, "events")
+            with open(os.path.join(self.work, "playbooks", "release", "github-app-token.py"), "w") as shim:
+                shim.write("import runpy, sys\n"
+                           f"open({log!r}, 'a').write('token ' + ('revoke' if '--revoke' in sys.argv else 'make') + '\\n')\n"
+                           f"sys.argv[1:] += ['--api', {stub.url!r}]\n"
+                           f"sys.argv[0] = {HELPER!r}\n"
+                           f"runpy.run_path({HELPER!r}, run_name='__main__')\n")
+            real = os.path.join(self.work, "playbooks", "nightly", "report-real.py")
+            os.rename(os.path.join(self.work, "playbooks", "nightly", "report.py"), real)
+            with open(os.path.join(self.work, "playbooks", "nightly", "report.py"), "w") as shim:
+                shim.write("import runpy, sys\n"
+                           f"open({log!r}, 'a').write('report ' + sys.argv[1] + '\\n')\n"
+                           "extra = {'decide': ['--now', '2026-07-10T02:00:30+00:00'], 'report': ['--api', %r]}.get(sys.argv[1], [])\n" % stand.url +
+                           "sys.argv[1:] += extra\n"
+                           f"sys.argv[0] = {real!r}\n"
+                           f"runpy.run_path({real!r}, run_name='__main__')\n")
+            status, output, _ = ansible(os.path.join(self.work, "playbooks", "nightly", "report.yaml"), {
+                "zuul": {"pipeline": "periodic-0200", "tenant": "aid", "buildset": "s" * 32,
+                         "executor": {"work_root": self.work}, "project": {"src_dir": "src"}},
+                "nightly_zuul_api": stand.url, "zuul_web_root": "https://zuul.example",
+                "aid_release_github": {"app_id": stub_github.APP_ID, "private_key": PEM.decode()}}, self.work)
+            with open(log) as handle:
+                events = handle.read().split()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(" ".join(events), "report decide report wait token make report report token revoke")
+        self.assertTrue(stub.revoked())
+        closed = [path for method, path, _, _ in stand.calls if method == "PATCH"]
+        self.assertEqual(closed, ["/repos/kristofk/AIDepartment/issues/5"])
+        for secret in stub.secrets():
+            self.assertNotIn(secret, output)
 
 
 if __name__ == "__main__":

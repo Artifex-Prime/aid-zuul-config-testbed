@@ -72,7 +72,7 @@ def zuul_plugins(work):
             "ZUUL_OUTPUT_MAX_BYTES": str(1024 * 1024 * 1024), "ZUUL_ANSIBLE_SPLIT_STREAMS": "False"}
 
 
-def ansible(playbook, extra_vars, work):
+def ansible(playbook, extra_vars, work, inventory="localhost,"):
     """Runs the playbook on localhost with Zuul's plugins; returns its exit status, its output, and what it returned to
     Zuul. Its output is Ansible's, the build's log (job-output.txt, with zuul_json's job-output.json in it), and the
     console log Zuul's command module wrote for each command task (/tmp/console-*.log, which Zuul streams)."""
@@ -88,7 +88,7 @@ def ansible(playbook, extra_vars, work):
            # The job's own temporary directory, as Zuul sets it (local_tmp, TMP).
            "ANSIBLE_LOCAL_TEMP": tmp, "TMP": tmp}
     consoles = set(glob.glob("/tmp/console-*.log"))
-    result = subprocess.run([ANSIBLE, "-i", "localhost,", "-c", "local", playbook, "-e", f"@{vars_file}",
+    result = subprocess.run([ANSIBLE, "-i", inventory, "-c", "local", playbook, "-e", f"@{vars_file}",
                              "-e", f"ansible_python_interpreter={sys.executable}",
                              # As verbose as Ansible goes: what no_log must keep out shows here first.
                              "-vvv"],

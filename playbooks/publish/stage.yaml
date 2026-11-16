@@ -38,8 +38,10 @@
         content: "{{ aid_release_github.private_key }}"
         dest: "{{ publish_executor_dir.path }}/key.pem"
         mode: "0600"
+      # A connection variable of a delegated task is templated as localhost's, where the node's registered
+      # publish_executor_dir is undefined: so by the node's hostvars (AIDepartment#1615).
       vars:
-        ansible_remote_tmp: "{{ publish_executor_dir.path }}"
+        ansible_remote_tmp: "{{ hostvars[inventory_hostname].publish_executor_dir.path }}"
       delegate_to: localhost
       no_log: true
       when: publish_permissions | length > 0

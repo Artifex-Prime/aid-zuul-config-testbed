@@ -1,12 +1,18 @@
 """The nightly's result, to AIDepartment's ci-nightly issue (AIDepartment#1350; its ci/zuul/publish.md, "The nightly").
 
-aid-nightly-report runs beside AIDepartment's aid-nightly in periodic, on the executor. It does what nightly.yml's
-report job does on GitHub Actions (AIDepartment's ci/nightly.mjs report), for the same issue: closes it when the
-nightly passed, otherwise comments on it or opens it. First, as aid-nightly's own script does, it lets through only
-the timer that is 04:00 in Madrid, and only while AIDepartment's ci/publisher names Zuul; otherwise it writes nothing.
-Then it waits for aid-nightly's result in this buildset, from Zuul's builds API.
+aid-nightly-report runs beside AIDepartment's aid-nightly in periodic-0200 and periodic-0300, on the executor. It does
+what nightly.yml's report job does on GitHub Actions (AIDepartment's ci/nightly.mjs report), for the same issue: closes
+it when the nightly passed, otherwise comments on it or opens it. In three steps, of which only the last has a
+credential, made just before it (playbooks/nightly/report.yaml), since an App's token lasts an hour and the wait two:
 
-    python3 report.py --publisher-file F --zuul URL --tenant T --buildset UUID --build-url URL --token-file F
+    python3 report.py decide --pipeline P --publisher-file F
+        whether this nightly is reported here: its pipeline's time is 04:00 in Madrid, as aid-nightly's own script
+        lets through (one pipeline per time, so a run that waited past the other time keeps its decision), and
+        AIDepartment's ci/publisher names Zuul. Prints {"report": true|false, ...}.
+    python3 report.py wait --zuul URL --tenant T --buildset UUID [--wait SECONDS]
+        aid-nightly's result in this buildset, from Zuul's buildset API. Prints {"result": "SUCCESS"|...|null}.
+    python3 report.py report --result R --build-url URL --token-file F
+        the result to the issue. An empty R is a nightly that had no result in time.
 
 Standard library only. Reaches api.github.com through the environment's https_proxy, as the executor does.
 """
@@ -25,8 +31,8 @@ REPOSITORY = "kristofk/AIDepartment"
 LABEL = "ci-nightly"
 TITLE = "Nightly CI failed"
 JOB = "aid-nightly"
-# The periodic pipeline's two times (zuul.d/pipelines.yaml), in UTC: Zuul's timer has no time zone.
-SCHEDULES = (2, 3)
+# The periodic pipelines (zuul.d/pipelines.yaml), each at one hour, UTC: Zuul's timer has no time zone.
+PIPELINES = {"periodic-0200": 2, "periodic-0300": 3}
 
 
 class Failure(Exception):
@@ -46,13 +52,12 @@ def madrid_offset(instant):
     return 2 if start <= instant < end else 1
 
 
-def fired(now):
-    """The timer that fired: the latest of SCHEDULES at or before now (AIDepartment's ci/nightly.mjs, zuulSchedule)."""
-    candidates = []
-    for hour in SCHEDULES:
-        today = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        candidates.append(today if today <= now else today - datetime.timedelta(days=1))
-    return max(candidates)
+def fired(pipeline, now):
+    """When the pipeline's timer fired: its hour, the latest at or before now (a run waits hours at most, not a day)."""
+    if pipeline not in PIPELINES:
+        raise Failure(f"pipeline {pipeline!r} is none of {', '.join(PIPELINES)}")
+    today = now.replace(hour=PIPELINES[pipeline], minute=0, second=0, microsecond=0)
+    return today if today <= now else today - datetime.timedelta(days=1)
 
 
 def is_madrid_four(instant):
@@ -79,17 +84,23 @@ def call(method, url, token=None, body=None, ok=(200, 201)):
     return json.loads(text) if text else None
 
 
-def nightly_result(zuul, tenant, buildset, deadline, interval=60):
-    """aid-nightly's result in the buildset; None when it has none by the deadline."""
-    query = urllib.parse.urlencode({"buildset": buildset, "job_name": JOB})
+def nightly_result(zuul, tenant, buildset, deadline, interval=60, sleep=time.sleep, clock=time.time):
+    """aid-nightly's result in the buildset (Zuul's GET /api/tenant/<tenant>/buildset/<uuid>, whose builds each have
+    job_name and result); None when it has none by the deadline. A buildset Zuul has not stored yet is waited for."""
+    url = f"{zuul.rstrip('/')}/api/tenant/{urllib.parse.quote(tenant)}/buildset/{urllib.parse.quote(buildset)}"
     while True:
-        builds = call("GET", f"{zuul.rstrip('/')}/api/tenant/{tenant}/builds?{query}") or []
-        done = [build for build in builds if build.get("result")]
+        try:
+            found = call("GET", url) or {}
+        except Failure as error:
+            if not str(error).endswith(": 404"):
+                raise
+            found = {}
+        done = [build for build in found.get("builds", []) if build.get("job_name") == JOB and build.get("result")]
         if done:
-            return done[0]["result"], done[0].get("uuid")
-        if time.time() + interval > deadline:
-            return None, None
-        time.sleep(interval)
+            return done[-1]["result"]
+        if clock() + interval > deadline:
+            return None
+        sleep(interval)
 
 
 def report(result, link, token, api=API, today=None):
@@ -118,33 +129,37 @@ def report(result, link, token, api=API, today=None):
     return "created", [created["number"]]
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--publisher-file", required=True, help="AIDepartment's ci/publisher, in the job's checkout")
-    parser.add_argument("--zuul", required=True, help="zuul-web's address, from the executor")
-    parser.add_argument("--tenant", required=True)
-    parser.add_argument("--buildset", required=True)
-    parser.add_argument("--build-url", required=True, help="the nightly's buildset or build page, for the issue")
-    parser.add_argument("--token-file", help="the App's token, with issues: write; without it, decide only")
-    parser.add_argument("--wait", type=int, default=6600, help="seconds to wait for aid-nightly's result")
+    parser.add_argument("step", choices=["decide", "wait", "report"])
+    parser.add_argument("--pipeline", help="decide: the pipeline this runs in")
+    parser.add_argument("--publisher-file", help="decide: AIDepartment's ci/publisher, in the job's checkout")
+    parser.add_argument("--zuul", help="wait: zuul-web's address, from the executor")
+    parser.add_argument("--tenant", help="wait")
+    parser.add_argument("--buildset", help="wait")
+    parser.add_argument("--wait", type=int, default=6600, help="wait: seconds to wait for aid-nightly's result")
+    parser.add_argument("--result", help="report: aid-nightly's result, empty for none")
+    parser.add_argument("--build-url", help="report: the nightly's buildset page, for the issue")
+    parser.add_argument("--token-file", help="report: the App's token, with issues: write")
     parser.add_argument("--now", help=argparse.SUPPRESS)
     parser.add_argument("--api", default=API, help=argparse.SUPPRESS)
-    args = parser.parse_args()
-    now = datetime.datetime.fromisoformat(args.now) if args.now else datetime.datetime.now(datetime.timezone.utc)
-    instant = fired(now)
-    if not is_madrid_four(instant):
-        return {"report": False, "why": f"the timer of {instant:%Y-%m-%dT%H:%MZ} is not 04:00 in Madrid"}
-    with open(args.publisher_file) as handle:
-        publisher = handle.read().strip()
-    if publisher != "zuul":
-        return {"report": False, "why": f"ci/publisher names {publisher!r}: {publisher} reports the nightly"}
-    if not args.token_file:
-        return {"report": True}
-    result, _ = nightly_result(args.zuul, args.tenant, args.buildset, time.time() + args.wait)
+    args = parser.parse_args(argv)
+    if args.step == "decide":
+        now = datetime.datetime.fromisoformat(args.now) if args.now else datetime.datetime.now(datetime.timezone.utc)
+        instant = fired(args.pipeline, now)
+        if not is_madrid_four(instant):
+            return {"report": False, "why": f"{args.pipeline}'s timer of {instant:%Y-%m-%dT%H:%MZ} is not 04:00 in Madrid"}
+        with open(args.publisher_file) as handle:
+            publisher = handle.read().strip()
+        if publisher != "zuul":
+            return {"report": False, "why": f"ci/publisher names {publisher!r}: {publisher} reports the nightly"}
+        return {"report": True, "why": f"{args.pipeline}'s timer of {instant:%Y-%m-%dT%H:%MZ} is 04:00 in Madrid"}
+    if args.step == "wait":
+        return {"result": nightly_result(args.zuul, args.tenant, args.buildset, time.time() + args.wait)}
     with open(args.token_file) as handle:
         token = handle.read().strip()
-    action, issues = report(result, args.build_url, token, api=args.api.rstrip("/"))
-    return {"report": True, "result": result, "action": action, "issues": issues}
+    action, issues = report(args.result or None, args.build_url, token, api=args.api.rstrip("/"))
+    return {"result": args.result or None, "action": action, "issues": issues}
 
 
 if __name__ == "__main__":
