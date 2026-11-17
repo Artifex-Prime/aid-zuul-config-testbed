@@ -46,10 +46,9 @@ define no pipeline and no base job, and Zuul refuses either with a configuration
 
 ## The build node
 
-`zuul.d/providers.yaml` allocates disposable Kubernetes pods for `aid-node`, `aid-gate-node` and `aid-post-node`
+`zuul.d/providers.yaml` allocates disposable Kubernetes pods for `aid-check-pod-node`, `aid-gate-pod-node` and `aid-post-pod-node`
 (AIDepartment#1698). Each provider has one pod slot, `reuse: false` and a separate connection/namespace:
-`aid-check-pods` / `zuul-nodes`, `aid-gate-pods` / `zuul-gate`, and `aid-post-pods` / `zuul-post`. Jobs and labels stay
-as they are. Post-review publishing stays on the post identity and never uses the PR node's farm credential.
+`aid-check-pods` / `zuul-nodes`, `aid-gate-pods` / `zuul-gate`, and `aid-post-pods` / `zuul-post`. Provider and label names are distinct from the retired static nodes (AIDepartment#1754). Post-review publishing stays on the post identity and never uses the PR node's farm credential.
 
 AIDepartment's pinned launcher adds fixed-namespace support to Zuul 14.3's Kubernetes driver. The admin-owned
 `PodTemplate/job-node` supplies the checked image, resource budget, security, mounts and service account. The
@@ -63,17 +62,24 @@ before and after each job (AIDepartment#1655). It does not share Kubernetes node
 
 Coordinate deployment with AIDepartment's `ci/zuul/disposable-nodes.md`; only clean, merged main commits may be
 applied to live infrastructure. Do not activate these providers until the launcher, fixed connections, templates
-and RBAC are deployed. Capture green gate and post publication plus fresh pod UID/deletion evidence on #1698.
+and RBAC are deployed. Before a driver switch, pause admissions, drain jobs and retire retained static
+requests/nodes under Zuul coordination locks, using the static lifecycle after confirming no owner and no static pod.
+Scaling a controller to zero is insufficient. Never alias the retired labels or send a StaticProviderNode through
+Kubernetes cleanup. AID's runbook records the exact #1754 incident IDs, ownership checks and original-range retry.
+Keep config #31 and AID #1756 held for the orchestrator: merge config first, then admit AID's updated gate nodeset;
+old AID gate-image jobs must remain drained between merges. Capture green check/gate and post publication plus
+fresh pod UID/deletion evidence on #1754/#1698.
 
 `check-external` is blocked by the base job's trusted pre-run until a separate credential-free execution boundary
 exists. It fails before checkout and before any untrusted pre/run/post/cleanup playbook, and tells Zuul not to retry.
 The shared pod's raw projected token is readable by its job user; a conditional credential helper cannot secure that
-pipeline. Do not remove the guard while external jobs could use `aid-node`. The standard Compose test bed seeds a
+pipeline. Do not remove the guard while external jobs could use `aid-check-pod-node`. The standard Compose test bed seeds a
 fake readable farm token and proves that all four malicious hooks run in `check` and none run in `check-external`.
 
 The executor's existing SSH key remains in its Secret; node templates mount each namespace's authorized key
-and SSH host key. Only staging keeps its static provider host-key pin. The Kubernetes launcher discovers a fresh
-pod's SSH endpoint using the existing driver nodescan. Private keys remain in AID's keychain/Kubernetes Secrets.
+and SSH host key. Only staging keeps its static provider host-key pin. The coordinated launcher overrides the Kubernetes label's kubectl default to enable SSH host-key checking.
+Its real nodescan must connect and populate the executor's known_hosts before the job starts; inventory never
+sets `StrictHostKeyChecking=false` for these nodes. Private keys remain in AID's keychain/Kubernetes Secrets.
 
 ## AID events (#1349)
 
@@ -97,7 +103,7 @@ job that names one:
 
 - is defined here, in a file of `zuul.d/` with only such jobs and where they run (the test bed leaves those files out);
 - is `final: true` and `post-review: true`, with `allowed-projects`;
-- runs with `nodeset: {nodes: []}`, or on a node of its own, never `aid-node`: the publishing jobs run on `aid-post-node`
+- runs with `nodeset: {nodes: []}`, or on a node of its own, never `aid-check-pod-node`: the publishing jobs run on `aid-post-pod-node`
   (AIDepartment's `deploy/zuul/post-node/`), which only they name;
 - starts with `pre-run: playbooks/secrets/guard.yaml`, and sets `secret_pipelines` and `secret_projects` in its `vars`.
 
@@ -154,3 +160,20 @@ python3.12 -m venv /tmp/cfg-tests && /tmp/cfg-tests/bin/pip install -r tests/req
 /tmp/cfg-tests/bin/pip install --no-deps -r tests/zuul-requirements.txt
 PATH=/tmp/cfg-tests/bin:$PATH python -I -m unittest discover -s tests -v
 ```
+
+For the disposable providers, run the schema and real SSH verification regression together, using the coordinated
+AID checkout and a Python environment with the full `zuul==14.3.0` runtime:
+
+```sh
+python tests/check_providers.py --launcher /path/to/AIDepartment/deploy/zuul/server/launcher
+```
+
+This constructs actual provider labels from this YAML, negotiates SSH against a local fixture, and checks the real
+launcher and executor inventory paths. No cluster or publishing credentials are used. Deploy this launcher fix
+before activating the new provider connections; a schema-only pass cannot establish server authentication.
+
+The same checker runs `provider_identity.py`: retained real `StaticProviderNode` records cannot satisfy the
+new requests in Zuul's actual launcher filter or resolve to the Kubernetes provider by canonical name. It
+isolates the provider and label barriers, verifies fresh pod allocations still match, and exercises drained
+static cleanup with the upstream static driver. It also checks base/post/gate nodesets and the Compose fixture
+against the coordinated AID checkout. An old provider name or label makes the regression fail.
