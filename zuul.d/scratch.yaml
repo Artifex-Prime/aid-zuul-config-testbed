@@ -1,0 +1,25 @@
+# Hourly age fallback: no node, no push, and the same job-wide exclusion as gate/post.
+# The project job is deliberately not enrolled until the operator's final activation step.
+- pipeline:
+    name: periodic-scratch
+    description: Hourly scratch-registry maintenance under producer exclusion.
+    manager: independent
+    post-review: true
+    trigger:
+      timer:
+        - time: '0 * * * *'
+
+- job:
+    name: aid-scratch-maintenance
+    parent: base
+    final: true
+    post-review: true
+    allowed-projects: [kristofk/AIDepartment]
+    nodeset: {nodes: []}
+    semaphores: [aid-scratch-registry]
+    attempts: 1
+    timeout: 300
+    run: playbooks/scratch/maintenance.yaml
+
+# Activation: add aid-scratch-maintenance to kristofk/AIDepartment's periodic-scratch
+# jobs only in the coordinated rollout window, then set post/gate lifecycle to 1 last.

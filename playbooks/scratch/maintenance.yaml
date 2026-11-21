@@ -1,0 +1,16 @@
+# Running on the executor leaves no node writers/consumers. The service checks the
+# requesting build really holds aid-scratch-registry; failure must fail the job.
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Reclaim scratch under the hourly job's own semaphore ownership
+      ansible.builtin.uri:
+        url: "{{ scratch_control_url | default('http://scratch-control.arc-janitor.svc:8081') }}/admit"
+        method: POST
+        body_format: json
+        body:
+          build: "{{ zuul.build }}"
+        status_code: 200
+        timeout: 120
+        use_proxy: false
+        follow_redirects: none

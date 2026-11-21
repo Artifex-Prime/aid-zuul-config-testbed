@@ -1,0 +1,13 @@
+# post-run.cleanup runs on success, failure and cancellation, before base log collection.
+- hosts: all
+  tasks:
+    - name: Clean this attempt after all publishing consumers finish
+      when: (publish_endpoints.CI_SCRATCH_LIFECYCLE | default('0') | string) == '1'
+      block:
+        - name: The shared attempt environment
+          ansible.builtin.include_tasks: scratch-env.yaml
+        - name: Fence check pods and delete only the attempt's owned manifest links
+          ansible.builtin.command:
+            argv: [./ci/zuul/scratch-cleanup.sh, "{{ zuul.build }}"]
+            chdir: "{{ zuul.project.src_dir }}"
+          environment: "{{ scratch_environment }}"

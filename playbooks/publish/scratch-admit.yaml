@@ -1,0 +1,12 @@
+# Trusted, once before the first push; job-wide semaphore remains held through cleanup.
+- hosts: all
+  tasks:
+    - name: Admit scratch use only after coordinated activation
+      when: (publish_endpoints.CI_SCRATCH_LIFECYCLE | default('0') | string) == '1'
+      block:
+        - name: The shared attempt environment
+          ansible.builtin.include_tasks: scratch-env.yaml
+        - name: Fence previous writers and reclaim storage before this attempt
+          ansible.builtin.command:
+            argv: ["{{ scratch_control_hook | default('/usr/local/libexec/aid-scratch-control') }}", admit]
+          environment: "{{ scratch_environment }}"

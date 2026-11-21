@@ -1,0 +1,8 @@
+# Identical durable state for pre-run, every publish stage and cleanup (AIDepartment#1817).
+- name: Scratch attempt environment
+  ansible.builtin.set_fact:
+    scratch_environment: >-
+      {{ publish_endpoints | combine({
+           'GITHUB_RUN_ID': zuul.build, 'GITHUB_RUN_ATTEMPT': '1',
+           'RUNNER_NAME': 'zuul-' ~ zuul.build,
+           'ZUUL_STATE': publish_root, 'CI_SCRATCH_STATE': publish_root ~ '/scratch'}) }}

@@ -44,17 +44,37 @@ define no pipeline and no base job, and Zuul refuses either with a configuration
 - Zuul's `check` on the pull request reports a configuration error, if any, before the merge.
 - After the merge, `curl <zuul-web>/api/tenant/aid/config-errors` is empty if it loaded.
 
+## Nightly admission (AIDepartment#2051)
+
+The periodic pipelines use high precedence and gate uses normal: once a running compute
+job releases its slot, the nightly queues ahead of new gates. Gate capacity stays
+unchanged during the day. `zuul.d/nightly.yaml` adds a node-free clock dependency;
+its `zuul.child_jobs` skips the off-hour compute job before allocation. The reporter
+stays independent, uses the same clock helper, and reports `START_TIMEOUT` if
+the SQL build start is absent or later than one hour after the scheduled slot.
+The result deadline remains 110 minutes after the reporter starts, roughly at
+the scheduled slot; a later compute start leaves less time before a missing-result
+report, while the compute job keeps its own two-hour timeout. No credential
+is acquired until after that wait.
+
+After independent review, the orchestrator merges this config and checks the loaded
+layout for both timers: inspect the frozen `aid-nightly` job and confirm that its
+dependencies retain `aid-nightly-clock` after merging the trusted and untrusted
+project variants; off-hour compute SKIPPED with no node request, matching-hour
+compute admitted ahead of queued gates, and a missed start reported to `ci-nightly`.
+No provider, quota or live cluster change is part of this patch.
+
 ## The build node
 
 `zuul.d/providers.yaml` allocates disposable Kubernetes pods for `aid-check-pod-node`, `aid-gate-pod-node` and `aid-post-pod-node`
-(AIDepartment#1698). Each provider has one pod slot, `reuse: false` and a separate connection/namespace:
+(AIDepartment#1698). The check provider has three pod slots (AIDepartment#1862, #1885), gate and post one each; every provider has `reuse: false` and a separate connection/namespace:
 `aid-check-pods` / `zuul-nodes`, `aid-gate-pods` / `zuul-gate`, and `aid-post-pods` / `zuul-post`. Provider and label names are distinct from the retired static nodes (AIDepartment#1754). Post-review publishing stays on the post identity and never uses the PR node's farm credential.
 
 AIDepartment's pinned launcher adds fixed-namespace support to Zuul 14.3's Kubernetes driver. The admin-owned
 `PodTemplate/job-node` supplies the checked image, resource budget, security, mounts and service account. The
 provider's `spec: {}` satisfies the upstream label schema; the launcher never uses it as a job-controlled pod spec.
 The launcher can create/delete pods and read the template in the three bounded namespaces, but cannot create
-namespaces, modify policy/RBAC/templates, or read Secrets. The namespace quotas admit one pod each; jobs queue in
+namespaces, modify policy/RBAC/templates, or read Secrets. The namespace quotas admit three check pods and one gate and one post pod, matching each provider's limit; jobs queue in
 Zuul. Pods and their homes/processes are deleted after every job. Shared caches are read-only to jobs.
 
 The Docker staging VM stays on `aid-nodes`' static provider as `aid-staging-node`: the base job resets its snapshot
@@ -66,9 +86,9 @@ and RBAC are deployed. Before a driver switch, pause admissions, drain jobs and 
 requests/nodes under Zuul coordination locks, using the static lifecycle after confirming no owner and no static pod.
 Scaling a controller to zero is insufficient. Never alias the retired labels or send a StaticProviderNode through
 Kubernetes cleanup. AID's runbook records the exact #1754 incident IDs, ownership checks and original-range retry.
-Keep config #31 and AID #1756 held for the orchestrator: merge config first, then admit AID's updated gate nodeset;
-old AID gate-image jobs must remain drained between merges. Capture green check/gate and post publication plus
-fresh pod UID/deletion evidence on #1754/#1698.
+History: config #31 and AID #1756 merged on 2026-11-17, config first and then AID's updated gate nodeset, with old
+AID gate-image jobs drained between the two merges; #1754 and #1698 closed the same day. Remaining migration work
+follows AIDepartment's runbook, [`deploy/thunderbox/zuul.md`, "Completing the native-launcher migration (#1492)"](https://github.com/kristofk/AIDepartment/blob/main/deploy/thunderbox/zuul.md#completing-the-native-launcher-migration-1492).
 
 `check-external` is blocked by the base job's trusted pre-run until a separate credential-free execution boundary
 exists. It fails before checkout and before any untrusted pre/run/post/cleanup playbook, and tells Zuul not to retry.
@@ -177,3 +197,64 @@ new requests in Zuul's actual launcher filter or resolve to the Kubernetes provi
 isolates the provider and label barriers, verifies fresh pod allocations still match, and exercises drained
 static cleanup with the upstream static driver. It also checks base/post/gate nodesets and the Compose fixture
 against the coordinated AID checkout. An old provider name or label makes the regression fail.
+
+It first runs `provider_pins.py` (AIDepartment#1915), which pins every provider's section, connection, label,
+limits and image. It also checks each connection's namespace in AID's `deploy/zuul/server/config/zuul.conf`, and
+each namespace's `job-node` PodTemplate image. The gate compute provider must run the PR node image `zuul-node`, the
+check node's image. Changing any of these values in either repository makes the regression fail until its pin
+changes with it.
+
+## Native launcher only (AIDepartment#1492)
+
+All production labels must be supplied by the native providers in `zuul.d/providers.yaml`.
+There is no Nodepool service. Tenant `aid` must set `use-nodepool: false`; the tenant file is owned by
+AIDepartment at `deploy/zuul/server/config/main.yaml`, rather than by this config project. Its Compose
+fixture sets the same flag and checks that a job requesting an unknown label fails configuration
+before any build dispatch. Keep this policy separate from provider `resource-limits` changes.
+
+The orchestrator applies only reviewed, merged commits, then full-reconfigures and follows
+[AIDepartment's migration runbook](https://github.com/kristofk/AIDepartment/blob/main/deploy/thunderbox/zuul.md#completing-the-native-launcher-migration-1492).
+Disabling fallback does not convert pre-provider Nodepool requests: inventory their owning queue items,
+dequeue/cancel through Zuul, verify cleanup, recheck the current head and author permission, and replay
+only eligible collaborator checks. Never mutate ZooKeeper request records by hand or bypass the
+`check-external` guard. Check, gate, post and staging retain their separate trust levels.
+
+A ready node, SSH and direct remote Bazel are insufficient rollout acceptance. Require a real
+Zuul-dispatched collaborator job on the loaded native provider to complete successfully; record its
+head, buildset/build/log URLs, provider/node and executor start, and prove no legacy requests remain
+waiting before releasing admissions. This PR authorizes no live apply; the orchestrator merges here.
+
+## Scratch lifecycle companion (#1817)
+
+`aid-publish-apps`, `aid-release` and `aid-publish-images` hold the job-wide
+`aid-scratch-registry` semaphore through their producer/consumer stages and cleanup.
+Their secret guard remains first. The following pre-run calls the installed hook's
+`admit` once, with the same build UUID and `publish_root/scratch` journal used by all
+stages; cleanup post-run calls AID's `scratch-cleanup.sh`, including after cancellation.
+The hook is mounted on the post node from the operator-owned ConfigMap. Failed
+admission or cleanup is reported, not retried or ignored.
+
+This companion intentionally leaves `publish_endpoints.CI_SCRATCH_LIFECYCLE` at `"0"`.
+The orchestrator sets it to `"1"` only after applying the merged node mounts, service
+and grants, draining old producers/consumers, and confirming the maintenance service.
+Gate's endpoints are activated in the same quiet window. No merge here applies a
+live manifest or enables registry rotation by itself.
+
+`periodic-scratch` defines the hourly pipeline and `aid-scratch-maintenance` the
+executor-only job. It holds the same semaphore and POSTs its own `zuul.build` to
+`http://scratch-control.arc-janitor.svc:8081/admit`. It is deliberately not enrolled
+on the project before rollout. To enable it during the activation window, add:
+
+```yaml
+- project:
+    name: kristofk/AIDepartment
+    periodic-scratch:
+      jobs:
+        - aid-scratch-maintenance
+```
+
+Disable that project enrollment before removing the service during rollback.
+`tests/test_scratch.py` exercises the real Ansible/Zuul plugins with hook and HTTP
+stand-ins: shared durable state, off-state, refusals and cleanup failures, maintenance
+request identity, hourly scheduling and job-wide semaphore/cleanup wiring. No private
+service implementation or live rollout evidence is copied into this repository.
