@@ -14,7 +14,7 @@
     parent: base
     final: true
     post-review: true
-    allowed-projects: [kristofk/AIDepartment]
+    allowed-projects: [Artifex-Prime/aid-zuul-testbed]
     nodeset: {nodes: []}
     semaphores: [aid-scratch-registry]
     attempts: 1
