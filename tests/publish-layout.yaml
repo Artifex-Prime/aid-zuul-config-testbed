@@ -1,0 +1,205 @@
+# What publishes from AIDepartment's main (AIDepartment#1350; its ci/zuul/publish.md): the app images, AID's release,
+# the release index and the infrastructure images (AIDepartment#1650), in post, and the nightly's report, in
+# periodic-0200 and periodic-0300. Each job has secrets, so each is made as
+# zuul.d/release.yaml's aid-release-credentials is (AIDepartment's deploy/zuul/job-secrets.md): final, post-review,
+# for AIDepartment alone, the shared guard first, and on nodes of its own: the post node (AIDepartment's
+# deploy/zuul/post-node/), which no pull request's job ever gets, or none.
+#
+# Each job runs AIDepartment's script for it from main's checkout, one stage per playbook (playbooks/publish/), and each
+# stage gets only the credentials it uses (publish_stages): a token of the App aid-release, made as the stage starts
+# with only the permissions listed and revoked when it ends, and Zuul's OIDC token for ThunderBox's pusher, signed as
+# the stage starts. publish_endpoints and zuul_web_root are ThunderBox's and Zuul's (ci/zuul/publish.md, "Turning it on").
+
+- nodeset:
+    name: aid-post
+    nodes:
+      - name: node
+        label: aid-post-pod-node
+
+- job:
+    name: aid-publish-apps
+    parent: base
+    description: |
+      On a merge into AIDepartment's main, each application whose payload changed: its image built, checked and
+      published through ThunderBox's pusher, and its declaration recorded in the release index, which GitHub Pages
+      serves (AIDepartment's ci/zuul/publish/apps.sh). Only while AIDepartment's ci/publisher names Zuul.
+    final: true
+    post-review: true
+    allowed-projects:
+      - kristofk/AIDepartment
+    nodeset: aid-post
+    semaphores: [aid-scratch-registry]
+    attempts: 1
+    # The tenant's maximum (AIDepartment's deploy/zuul/server/config/main.yaml).
+    timeout: 7200
+    pre-run:
+      - playbooks/secrets/guard.yaml
+      - playbooks/publish/scratch-admit.yaml
+    run:
+      - playbooks/publish/build.yaml
+      - playbooks/publish/push.yaml
+      - playbooks/publish/record.yaml
+    post-run:
+      - name: playbooks/publish/scratch-cleanup.yaml
+        cleanup: true
+    secrets: &publish-secrets
+      - name: aid_release_github
+        secret: aid-release-github
+      - name: aid_pusher
+        secret: aid-pusher
+    vars:
+      secret_pipelines: [post]
+      secret_projects: [github.com/kristofk/AIDepartment]
+      publish_script: ci/zuul/publish/apps.sh
+      publish_stages:
+        # The push's base, fetched by the policy.
+        build: {permissions: [contents=read]}
+        push: {permissions: [], pusher: true}
+        # The index branch.
+        record: {permissions: [contents=write]}
+      # ThunderBox's, for the post node (ThunderBox#90, #91), and its own BuildKit (AIDepartment#1566).
+      publish_endpoints: &endpoints
+        BUILDKIT_HOST: tcp://buildkitd.zuul-post-buildkit.svc:1234
+        CI_SCRATCH_REGISTRY: registry-scratch.arc-scratch.svc:5000
+        CI_RUN_NAMESPACE: arc-imagecheck
+        # Operator changes to "1" last, after merged templates/grants and a drained quiet window.
+        CI_SCRATCH_LIFECYCLE: "0"
+        CI_PUBLISH_URL: http://pusher.arc-release.svc:8080/v1/publish
+        CI_PUBLISH_AUDIENCE: thunderbox-registry
+        # The image check's API (ci/image-run.mjs's kubectl, in-cluster): the job's commands reach the node over SSH,
+        # whose session has none of the pod's KUBERNETES_SERVICE_* (AIDepartment#1622). By name, since .svc is in the
+        # node's NO_PROXY and the API's address is not; the post account's token is the pod's own mount.
+        KUBERNETES_SERVICE_HOST: kubernetes.default.svc
+        KUBERNETES_SERVICE_PORT: "443"
+        # Each copy's limit: the job's two hours hold the builds and every copy.
+        CI_PUBLISH_TIMEOUT_SECONDS: "900"
+      # Zuul's web root, its OIDC issuer (/.well-known/openid-configuration), as the build links use it.
+      zuul_web_root: &web-root http://web.zuul.svc.cluster.local:9000
+      publish_root: &root "{{ ansible_user_dir }}/zuul-publish"
+      publish_credentials: &credentials "{{ ansible_user_dir }}/zuul-publish-credentials"
+
+- job:
+    name: aid-release
+    parent: base
+    description: |
+      On a merge into AIDepartment's main that changes VERSION: the release folder built clean, AID's three images
+      built, checked and published through ThunderBox's pusher, the GitHub Release aid-v<version> created, and its
+      entry recorded in the release index (AIDepartment's ci/zuul/publish/release.sh). A failure opens the release's
+      issue. Only while AIDepartment's ci/publisher names Zuul.
+    final: true
+    post-review: true
+    allowed-projects:
+      - kristofk/AIDepartment
+    nodeset: aid-post
+    semaphores: [aid-scratch-registry]
+    attempts: 1
+    timeout: 7200
+    pre-run:
+      - playbooks/secrets/guard.yaml
+      - playbooks/publish/scratch-admit.yaml
+    run:
+      - playbooks/publish/build.yaml
+      - playbooks/publish/push.yaml
+      - playbooks/publish/record.yaml
+    post-run:
+      - playbooks/publish/report.yaml
+      - name: playbooks/publish/scratch-cleanup.yaml
+        cleanup: true
+    secrets: *publish-secrets
+    vars:
+      secret_pipelines: [post]
+      secret_projects: [github.com/kristofk/AIDepartment]
+      publish_script: ci/zuul/publish/release.sh
+      publish_stages:
+        # The push's base and the tags, read by the plan.
+        build: {permissions: [contents=read]}
+        # Asked once more before the pusher.
+        push: {permissions: [contents=read], pusher: true}
+        # The GitHub Release and the index branch.
+        record: {permissions: [contents=write]}
+        report: {permissions: [issues=write]}
+      publish_endpoints: *endpoints
+      zuul_web_root: *web-root
+      publish_root: *root
+      publish_credentials: *credentials
+
+- job:
+    name: aid-publish-images
+    parent: base
+    description: |
+      On a merge into AIDepartment's main that changes their inputs: Zuul's node images (aid/zuul-node, the PR node's
+      and the post node's) and the build farm's worker image (aid/build-farm-worker) built, checked and published
+      through ThunderBox's pusher, for the admin to apply by digest (AIDepartment's ci/zuul/publish/images.sh,
+      AIDepartment#1650). Only while AIDepartment's ci/publisher names Zuul.
+    final: true
+    post-review: true
+    allowed-projects:
+      - kristofk/AIDepartment
+    nodeset: aid-post
+    semaphores: [aid-scratch-registry]
+    attempts: 1
+    # Its own two hours: the worker's build downloads a Swift toolchain and compiles with it.
+    timeout: 7200
+    pre-run:
+      - playbooks/secrets/guard.yaml
+      - playbooks/publish/scratch-admit.yaml
+    run:
+      - playbooks/publish/build.yaml
+      - playbooks/publish/push.yaml
+    post-run:
+      - name: playbooks/publish/scratch-cleanup.yaml
+        cleanup: true
+    secrets: *publish-secrets
+    vars:
+      secret_pipelines: [post]
+      secret_projects: [github.com/kristofk/AIDepartment]
+      publish_script: ci/zuul/publish/images.sh
+      publish_stages:
+        # The push's base, fetched by the policy.
+        build: {permissions: [contents=read]}
+        push: {permissions: [], pusher: true}
+      publish_endpoints: *endpoints
+      zuul_web_root: *web-root
+      publish_root: *root
+      publish_credentials: *credentials
+
+- job:
+    name: aid-nightly-report
+    parent: base
+    description: |
+      AIDepartment's aid-nightly's result, to its ci-nightly issue, at the periodic timer that is 04:00 in Madrid and
+      while ci/publisher names Zuul (playbooks/nightly/report.py).
+    final: true
+    post-review: true
+    allowed-projects:
+      - kristofk/AIDepartment
+    nodeset: {nodes: []}
+    attempts: 1
+    timeout: 7200
+    pre-run: playbooks/secrets/guard.yaml
+    run: playbooks/nightly/report.yaml
+    secrets:
+      - name: aid_release_github
+        secret: aid-release-github
+    vars:
+      secret_pipelines: [periodic-0200, periodic-0300]
+      secret_projects: [github.com/kristofk/AIDepartment]
+      # zuul-web, from the executor.
+      nightly_zuul_api: http://web.zuul.svc.cluster.local:9000
+      zuul_web_root: *web-root
+
+# Where they run (AIDepartment's ci/zuul/publish.md, "Turning it on", step 4). They publish nothing while AIDepartment's
+# ci/publisher names Actions: each one's script reads it first.
+- project:
+    name: kristofk/AIDepartment
+    post:
+      jobs:
+        - aid-publish-apps
+        - aid-release
+        - aid-publish-images
+    periodic-0200:
+      jobs:
+        - aid-nightly-report
+    periodic-0300:
+      jobs:
+        - aid-nightly-report
